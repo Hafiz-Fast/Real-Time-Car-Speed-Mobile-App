@@ -91,6 +91,10 @@ while cap.isOpened():
         if not track.is_confirmed():
             continue
 
+         # Skip tracks that haven't been matched recently (coasting/drifting)
+        if track.time_since_update > 1:  # more than 1 frame since last real detection
+            continue
+
         track_id = track.track_id
         x1, y1, x2, y2 = map(int, track.to_ltrb())
         cx = (x1 + x2) // 2
