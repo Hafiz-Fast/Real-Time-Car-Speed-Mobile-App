@@ -5,7 +5,7 @@ import numpy as np
 from collections import defaultdict, deque
 
 model = YOLO("yolov8n.pt")
-tracker = DeepSort(max_age=50)
+tracker = DeepSort(max_age=15)  # Fix 3: reduced from 50 to prevent ghost tracks
 VEHICLE_CLASSES = [2, 3, 5, 7]
 
 SOURCE_POINTS = np.float32([
@@ -16,7 +16,7 @@ SOURCE_POINTS = np.float32([
 ])
 
 REAL_WIDTH  = 7.0
-REAL_HEIGHT = 60.0  # confirmed correct from debug data
+REAL_HEIGHT = 60.0
 
 DEST_POINTS = np.float32([
     [0, 0],
@@ -79,7 +79,7 @@ while cap.isOpened():
     for box in results.boxes:
         class_id = int(box.cls[0])
         conf = float(box.conf[0])
-        if class_id in VEHICLE_CLASSES and conf > 0.4:
+        if class_id in VEHICLE_CLASSES and conf > 0.5:  # Fix 2: raised from 0.4 to 0.5
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             x1, y1 = int(x1*scale_x), int(y1*scale_y)
             x2, y2 = int(x2*scale_x), int(y2*scale_y)
@@ -91,8 +91,8 @@ while cap.isOpened():
         if not track.is_confirmed():
             continue
 
-         # Skip tracks that haven't been matched recently (coasting/drifting)
-        if track.time_since_update > 1:  # more than 1 frame since last real detection
+        # Fix 1: Skip coasting/drifting tracks — only draw if matched to a real detection this frame
+        if track.time_since_update > 1:
             continue
 
         track_id = track.track_id
@@ -129,16 +129,13 @@ while cap.isOpened():
                         else:
                             track_speeds[track_id] = 0.4 * prev + 0.6 * speed_kmh
 
-        # ── Draw ALL vehicles normally regardless of zone ──
         speed = track_speeds.get(track_id, 0)
 
         if speed > 0:
-            # Color by speed: green < 60, orange < 100, red >= 100
             color = (0, 255, 0) if speed < 60 else (0, 165, 255) if speed < 100 else (0, 0, 255)
             label = f"ID:{track_id}  {speed:.1f} km/h"
         else:
-            # Vehicle detected but no speed yet (outside zone or warming up)
-            color = (0, 255, 0)  # default green
+            color = (0, 255, 0)
             label = f"ID:{track_id}"
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
