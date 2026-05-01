@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import time
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Dict, List
@@ -21,14 +22,16 @@ VEHICLE_CLASSES = [2, 3, 5, 7]
 def load_config() -> Dict[str, Any]:
     if CONFIG_PATH.exists():
         return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    # Fallback: a very wide zone that covers the whole frame
+    # (will be replaced once calibrated from mobile)
     return {
         "real_width_m": 7.0,
         "real_height_m": 60.0,
         "source_points": [
-            [1851, 1115],
-            [2049, 1103],
-            [2295, 1750],
-            [1311, 1716],
+            [0, 0],
+            [1280, 0],
+            [1280, 720],
+            [0, 720],
         ],
     }
 
@@ -60,6 +63,7 @@ def build_calibration(config: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# Mutable global calibration (replaced live when mobile calibrates)
 CONFIG = load_config()
 CALIBRATION = build_calibration(CONFIG)
 MODEL = YOLO(str(MODEL_PATH))
@@ -67,15 +71,14 @@ MODEL = YOLO(str(MODEL_PATH))
 app = FastAPI()
 
 
-def pixel_to_world(pixel_point: Any) -> np.ndarray:
+def pixel_to_world(pixel_point: Any, homography: np.ndarray) -> np.ndarray:
     point = np.array([[pixel_point]], dtype=np.float32)
-    world_point = cv2.perspectiveTransform(point, CALIBRATION["homography"])
+    world_point = cv2.perspectiveTransform(point, homography)
     return world_point[0][0]
 
 
-def point_in_zone(px: int, py: int) -> bool:
-    polygon = CALIBRATION["zone_polygon"]
-    return cv2.pointPolygonTest(polygon, (float(px), float(py)), False) >= 0
+def point_in_zone(px: int, py: int, zone_polygon: np.ndarray) -> bool:
+    return cv2.pointPolygonTest(zone_polygon, (float(px), float(py)), False) >= 0
 
 
 def resize_for_inference(frame: np.ndarray, width: int = 640) -> np.ndarray:
@@ -98,14 +101,21 @@ def decode_base64_image(image_base64: str) -> np.ndarray:
 class SpeedEstimator:
     def __init__(self, model: YOLO) -> None:
         self.model = model
-        self.tracker = DeepSort(max_age=15)
-        self.track_history = defaultdict(lambda: deque(maxlen=25))
-        self.track_speeds = defaultdict(float)
+        self.tracker = DeepSort(
+            max_age=30,          # keep track alive for 30 missed frames (~2 s at 15 FPS)
+            n_init=2,            # confirm a track after only 2 detections (was 3)
+            nms_max_overlap=0.7, # allow more overlapping boxes through
+        )
+        # history stores (wall_time_seconds, world_x, world_y)
+        self.track_history: Dict[Any, deque] = defaultdict(lambda: deque(maxlen=30))
+        self.track_speeds: Dict[Any, float] = defaultdict(float)
         self.frame_count = 0
         self.skip_frames = 2
         self.min_positions = 4
 
-    def process_frame(self, frame: np.ndarray) -> Dict[str, Any]:
+    def process_frame(
+        self, frame: np.ndarray, calibration: Dict[str, Any]
+    ) -> Dict[str, Any]:
         self.frame_count += 1
         if self.frame_count % self.skip_frames != 0:
             return {
@@ -126,7 +136,7 @@ class SpeedEstimator:
         for box in results.boxes:
             class_id = int(box.cls[0])
             conf = float(box.conf[0])
-            if class_id in VEHICLE_CLASSES and conf > 0.5:
+            if class_id in VEHICLE_CLASSES and conf > 0.4:  # lowered threshold
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 x1, y1 = int(x1 * scale_x), int(y1 * scale_y)
                 x2, y2 = int(x2 * scale_x), int(y2 * scale_y)
@@ -134,22 +144,27 @@ class SpeedEstimator:
 
         tracks = self.tracker.update_tracks(raw_detections, frame=frame)
         detections: List[Dict[str, Any]] = []
+        now = time.time()
+
+        homography = calibration["homography"]
+        zone_polygon = calibration["zone_polygon"]
 
         for track in tracks:
             if not track.is_confirmed():
                 continue
-            if track.time_since_update > 1:
+            if track.time_since_update > 3:
                 continue
 
             track_id = track.track_id
             x1, y1, x2, y2 = map(int, track.to_ltrb())
             cx = (x1 + x2) // 2
-            cy = y2
+            cy = y2  # bottom-center of bounding box
 
-            if point_in_zone(cx, cy):
-                world_pos = pixel_to_world((cx, cy))
+            if point_in_zone(cx, cy, zone_polygon):
+                world_pos = pixel_to_world((cx, cy), homography)
+                # Store REAL wall-clock time instead of frame count
                 self.track_history[track_id].append(
-                    (self.frame_count, world_pos[0], world_pos[1])
+                    (now, world_pos[0], world_pos[1])
                 )
 
                 history = self.track_history[track_id]
@@ -159,33 +174,35 @@ class SpeedEstimator:
 
                     dx = newest[1] - oldest[1]
                     dy = newest[2] - oldest[2]
-                    dist_meters = np.sqrt(dx ** 2 + dy ** 2)
+                    dist_meters = float(np.sqrt(dx**2 + dy**2))
 
-                    frames_elapsed = newest[0] - oldest[0]
-                    time_elapsed = frames_elapsed / max(1.0, 15.0)
+                    # Real elapsed time in seconds
+                    time_elapsed = newest[0] - oldest[0]
 
-                    if time_elapsed > 0:
+                    if time_elapsed > 0.1:  # at least 100ms of history
                         speed_kmh = (dist_meters / time_elapsed) * 3.6
                         if 0 < speed_kmh < 250:
                             prev = self.track_speeds[track_id]
+                            alpha = 0.5  # smoothing
                             if prev == 0:
                                 self.track_speeds[track_id] = speed_kmh
                             else:
-                                self.track_speeds[track_id] = 0.4 * prev + 0.6 * speed_kmh
+                                self.track_speeds[track_id] = (
+                                    alpha * prev + (1 - alpha) * speed_kmh
+                                )
 
-            speed = self.track_speeds.get(track_id, 0)
+            speed = self.track_speeds.get(track_id, 0.0)
 
-            if speed > 0:
-                if speed < 60:
-                    color = [0, 255, 0]
-                elif speed < 100:
-                    color = [0, 165, 255]
-                else:
-                    color = [0, 0, 255]
-                label = f"ID:{track_id} {speed:.1f} km/h"
+            if speed >= 100:
+                color = [0, 0, 255]   # red — fast
+            elif speed >= 60:
+                color = [0, 165, 255]  # orange — medium
+            elif speed > 0:
+                color = [0, 255, 0]   # green — slow
             else:
-                color = [0, 255, 0]
-                label = f"ID:{track_id}"
+                color = [200, 200, 200]  # gray — no speed yet
+
+            label = f"ID:{track_id} {speed:.1f} km/h" if speed > 0 else f"ID:{track_id}"
 
             detections.append(
                 {
@@ -209,6 +226,79 @@ async def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/calibration")
+async def get_calibration() -> Dict[str, Any]:
+    """Return the current calibration so the mobile app can display it."""
+    return {
+        "real_width_m": CONFIG.get("real_width_m", 7.0),
+        "real_height_m": CONFIG.get("real_height_m", 60.0),
+        "source_points": CONFIG.get("source_points", []),
+        "is_calibrated": CONFIG_PATH.exists(),
+    }
+
+
+@app.websocket("/ws/calibrate")
+async def calibrate_endpoint(websocket: WebSocket) -> None:
+    """
+    Receives a JSON payload from mobile:
+    {
+        "image_base64": "<base64 jpeg>",
+        "points": [[x1,y1],[x2,y2],[x3,y3],[x4,y4]],  // in TL,TR,BR,BL order
+        "real_width_m": 7.0,
+        "real_height_m": 60.0
+    }
+    Saves config.json, reloads calibration, responds with confirmation.
+    """
+    global CONFIG, CALIBRATION
+
+    await websocket.accept()
+    try:
+        message = await websocket.receive_text()
+        payload = json.loads(message)
+
+        points = payload.get("points")
+        real_width = float(payload.get("real_width_m", 7.0))
+        real_height = float(payload.get("real_height_m", 60.0))
+
+        if not points or len(points) != 4:
+            await websocket.send_text(
+                json.dumps({"success": False, "error": "Need exactly 4 points"})
+            )
+            return
+
+        # Validate points are within frame bounds (basic sanity check)
+        for p in points:
+            if len(p) != 2:
+                await websocket.send_text(
+                    json.dumps({"success": False, "error": "Each point must be [x, y]"})
+                )
+                return
+
+        new_config = {
+            "real_width_m": real_width,
+            "real_height_m": real_height,
+            "source_points": points,
+        }
+
+        CONFIG_PATH.write_text(json.dumps(new_config, indent=2), encoding="utf-8")
+        CONFIG = new_config
+        CALIBRATION = build_calibration(new_config)
+
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "success": True,
+                    "message": "Calibration saved and applied",
+                    "source_points": points,
+                    "real_width_m": real_width,
+                    "real_height_m": real_height,
+                }
+            )
+        )
+    except Exception as exc:
+        await websocket.send_text(json.dumps({"success": False, "error": str(exc)}))
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
@@ -229,7 +319,13 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 continue
 
             frame = decode_base64_image(image_base64)
-            result = await loop.run_in_executor(None, estimator.process_frame, frame)
+
+            # Use the current global calibration (updated live after /ws/calibrate)
+            cal_snapshot = CALIBRATION
+
+            result = await loop.run_in_executor(
+                None, estimator.process_frame, frame, cal_snapshot
+            )
 
             response = {
                 "frame_id": frame_id,
