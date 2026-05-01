@@ -22,8 +22,6 @@ VEHICLE_CLASSES = [2, 3, 5, 7]
 def load_config() -> Dict[str, Any]:
     if CONFIG_PATH.exists():
         return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    # Fallback: a very wide zone that covers the whole frame
-    # (will be replaced once calibrated from mobile)
     return {
         "real_width_m": 7.0,
         "real_height_m": 60.0,
@@ -60,10 +58,12 @@ def build_calibration(config: Dict[str, Any]) -> Dict[str, Any]:
         "dest_points": dest_points,
         "homography": homography,
         "zone_polygon": zone_polygon,
+        # Store the frame size these points were calibrated against
+        "calibrated_width": float(config.get("frame_width", 1280)),
+        "calibrated_height": float(config.get("frame_height", 720)),
     }
 
 
-# Mutable global calibration (replaced live when mobile calibrates)
 CONFIG = load_config()
 CALIBRATION = build_calibration(CONFIG)
 MODEL = YOLO(str(MODEL_PATH))
@@ -98,45 +98,75 @@ def decode_base64_image(image_base64: str) -> np.ndarray:
     return frame
 
 
+def rescale_calibration_to_frame(
+    calibration: Dict[str, Any], frame_w: int, frame_h: int
+) -> Dict[str, Any]:
+    """
+    If the incoming frame is a different resolution than what was calibrated,
+    rescale the source points to match the frame's actual pixel space.
+    """
+    cal_w = calibration.get("calibrated_width", frame_w)
+    cal_h = calibration.get("calibrated_height", frame_h)
+
+    if abs(cal_w - frame_w) < 2 and abs(cal_h - frame_h) < 2:
+        return calibration  # No rescaling needed
+
+    sx = frame_w / cal_w
+    sy = frame_h / cal_h
+
+    original_src = np.float32(calibration["source_points"])
+    new_src = original_src * np.float32([sx, sy])
+
+    dest_points = calibration["dest_points"]
+    homography, _ = cv2.findHomography(new_src, dest_points)
+    zone_polygon = new_src.astype(np.int32)
+
+    return {
+        **calibration,
+        "source_points": new_src,
+        "homography": homography,
+        "zone_polygon": zone_polygon,
+    }
+
+
 class SpeedEstimator:
     def __init__(self, model: YOLO) -> None:
         self.model = model
         self.tracker = DeepSort(
-            max_age=30,          # keep track alive for 30 missed frames (~2 s at 15 FPS)
-            n_init=2,            # confirm a track after only 2 detections (was 3)
-            nms_max_overlap=0.7, # allow more overlapping boxes through
+            max_age=30,
+            n_init=2,
+            nms_max_overlap=0.7,
         )
-        # history stores (wall_time_seconds, world_x, world_y)
         self.track_history: Dict[Any, deque] = defaultdict(lambda: deque(maxlen=30))
         self.track_speeds: Dict[Any, float] = defaultdict(float)
         self.frame_count = 0
-        self.skip_frames = 2
-        self.min_positions = 4
+        # FIX: Do NOT skip frames for live mobile stream.
+        # The client is already slow (~5-10 FPS), every frame counts.
+        self.skip_frames = 1
+        self.min_positions = 3  # Reduced from 4 — easier to accumulate at low FPS
 
     def process_frame(
         self, frame: np.ndarray, calibration: Dict[str, Any]
     ) -> Dict[str, Any]:
         self.frame_count += 1
-        if self.frame_count % self.skip_frames != 0:
-            return {
-                "detections": [],
-                "frame_size": [frame.shape[1], frame.shape[0]],
-                "skipped": True,
-            }
+
+        frame_h, frame_w = frame.shape[:2]
+
+        # Rescale calibration zone to match incoming frame resolution
+        cal = rescale_calibration_to_frame(calibration, frame_w, frame_h)
 
         small_frame = resize_for_inference(frame, width=640)
-        height, width = frame.shape[:2]
         small_height, small_width = small_frame.shape[:2]
-        scale_x = width / small_width
-        scale_y = height / small_height
+        scale_x = frame_w / small_width
+        scale_y = frame_h / small_height
 
-        results = self.model(small_frame, verbose=False, imgsz=416)[0]
+        results = self.model(small_frame, verbose=False, imgsz=640)[0]  # FIX: 640 not 416
         raw_detections: List[Any] = []
 
         for box in results.boxes:
             class_id = int(box.cls[0])
             conf = float(box.conf[0])
-            if class_id in VEHICLE_CLASSES and conf > 0.4:  # lowered threshold
+            if class_id in VEHICLE_CLASSES and conf > 0.35:  # FIX: lower threshold for mobile
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 x1, y1 = int(x1 * scale_x), int(y1 * scale_y)
                 x2, y2 = int(x2 * scale_x), int(y2 * scale_y)
@@ -146,8 +176,8 @@ class SpeedEstimator:
         detections: List[Dict[str, Any]] = []
         now = time.time()
 
-        homography = calibration["homography"]
-        zone_polygon = calibration["zone_polygon"]
+        homography = cal["homography"]
+        zone_polygon = cal["zone_polygon"]
 
         for track in tracks:
             if not track.is_confirmed():
@@ -158,11 +188,12 @@ class SpeedEstimator:
             track_id = track.track_id
             x1, y1, x2, y2 = map(int, track.to_ltrb())
             cx = (x1 + x2) // 2
-            cy = y2  # bottom-center of bounding box
+            cy = y2  # bottom-center
 
-            if point_in_zone(cx, cy, zone_polygon):
+            in_zone = point_in_zone(cx, cy, zone_polygon)
+
+            if in_zone:
                 world_pos = pixel_to_world((cx, cy), homography)
-                # Store REAL wall-clock time instead of frame count
                 self.track_history[track_id].append(
                     (now, world_pos[0], world_pos[1])
                 )
@@ -175,15 +206,13 @@ class SpeedEstimator:
                     dx = newest[1] - oldest[1]
                     dy = newest[2] - oldest[2]
                     dist_meters = float(np.sqrt(dx**2 + dy**2))
-
-                    # Real elapsed time in seconds
                     time_elapsed = newest[0] - oldest[0]
 
-                    if time_elapsed > 0.1:  # at least 100ms of history
+                    if time_elapsed > 0.2:  # at least 200ms of history
                         speed_kmh = (dist_meters / time_elapsed) * 3.6
-                        if 0 < speed_kmh < 250:
+                        if 1 < speed_kmh < 250:
                             prev = self.track_speeds[track_id]
-                            alpha = 0.5  # smoothing
+                            alpha = 0.4
                             if prev == 0:
                                 self.track_speeds[track_id] = speed_kmh
                             else:
@@ -194,13 +223,13 @@ class SpeedEstimator:
             speed = self.track_speeds.get(track_id, 0.0)
 
             if speed >= 100:
-                color = [0, 0, 255]   # red — fast
+                color = [0, 0, 255]
             elif speed >= 60:
-                color = [0, 165, 255]  # orange — medium
+                color = [0, 165, 255]
             elif speed > 0:
-                color = [0, 255, 0]   # green — slow
+                color = [0, 255, 0]
             else:
-                color = [200, 200, 200]  # gray — no speed yet
+                color = [200, 200, 200]
 
             label = f"ID:{track_id} {speed:.1f} km/h" if speed > 0 else f"ID:{track_id}"
 
@@ -211,12 +240,13 @@ class SpeedEstimator:
                     "speed_kmh": float(speed),
                     "label": label,
                     "color": color,
+                    "in_zone": in_zone,
                 }
             )
 
         return {
             "detections": detections,
-            "frame_size": [width, height],
+            "frame_size": [frame_w, frame_h],
             "skipped": False,
         }
 
@@ -228,7 +258,6 @@ async def health() -> Dict[str, str]:
 
 @app.get("/calibration")
 async def get_calibration() -> Dict[str, Any]:
-    """Return the current calibration so the mobile app can display it."""
     return {
         "real_width_m": CONFIG.get("real_width_m", 7.0),
         "real_height_m": CONFIG.get("real_height_m", 60.0),
@@ -240,14 +269,15 @@ async def get_calibration() -> Dict[str, Any]:
 @app.websocket("/ws/calibrate")
 async def calibrate_endpoint(websocket: WebSocket) -> None:
     """
-    Receives a JSON payload from mobile:
+    Receives:
     {
         "image_base64": "<base64 jpeg>",
-        "points": [[x1,y1],[x2,y2],[x3,y3],[x4,y4]],  // in TL,TR,BR,BL order
+        "points": [[x1,y1],[x2,y2],[x3,y3],[x4,y4]],  // already in photo pixel coords
         "real_width_m": 7.0,
-        "real_height_m": 60.0
+        "real_height_m": 60.0,
+        "frame_width": 1280,   // actual photo pixel width
+        "frame_height": 720    // actual photo pixel height
     }
-    Saves config.json, reloads calibration, responds with confirmation.
     """
     global CONFIG, CALIBRATION
 
@@ -259,6 +289,8 @@ async def calibrate_endpoint(websocket: WebSocket) -> None:
         points = payload.get("points")
         real_width = float(payload.get("real_width_m", 7.0))
         real_height = float(payload.get("real_height_m", 60.0))
+        frame_width = int(payload.get("frame_width", 1280))
+        frame_height = int(payload.get("frame_height", 720))
 
         if not points or len(points) != 4:
             await websocket.send_text(
@@ -266,18 +298,12 @@ async def calibrate_endpoint(websocket: WebSocket) -> None:
             )
             return
 
-        # Validate points are within frame bounds (basic sanity check)
-        for p in points:
-            if len(p) != 2:
-                await websocket.send_text(
-                    json.dumps({"success": False, "error": "Each point must be [x, y]"})
-                )
-                return
-
         new_config = {
             "real_width_m": real_width,
             "real_height_m": real_height,
             "source_points": points,
+            "frame_width": frame_width,
+            "frame_height": frame_height,
         }
 
         CONFIG_PATH.write_text(json.dumps(new_config, indent=2), encoding="utf-8")
@@ -292,6 +318,8 @@ async def calibrate_endpoint(websocket: WebSocket) -> None:
                     "source_points": points,
                     "real_width_m": real_width,
                     "real_height_m": real_height,
+                    "frame_width": frame_width,
+                    "frame_height": frame_height,
                 }
             )
         )
@@ -319,8 +347,6 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 continue
 
             frame = decode_base64_image(image_base64)
-
-            # Use the current global calibration (updated live after /ws/calibrate)
             cal_snapshot = CALIBRATION
 
             result = await loop.run_in_executor(

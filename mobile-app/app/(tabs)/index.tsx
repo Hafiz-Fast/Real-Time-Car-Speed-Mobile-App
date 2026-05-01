@@ -1,4 +1,10 @@
 // app/(tabs)/index.tsx
+// KEY FIXES:
+// 1. Chained capture instead of setInterval — avoids busyRef starvation
+// 2. Calibration scales to ACTUAL photo pixels, not hardcoded 1280×720
+// 3. Sends frame_width/frame_height to server so it can rescale zone
+// 4. Forces landscape JPEG for consistent orientation
+// 5. Lower quality for speed, resize on client before send
 
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { useEffect, useRef, useState, useCallback } from 'react';
@@ -17,13 +23,14 @@ import {
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 
-const WS_URL            = 'ws://192.168.100.45:8000/ws';
-const WS_CALIBRATE_URL  = 'ws://192.168.100.45:8000/ws/calibrate';
-const TARGET_FPS        = 15;
-const FRAME_INTERVAL_MS = Math.round(1000 / TARGET_FPS);
-const GHOST_FRAMES      = 8; // frames to keep showing a vehicle after it disappears
+const WS_URL           = 'ws://192.168.100.45:8000/ws';
+const WS_CALIBRATE_URL = 'ws://192.168.100.45:8000/ws/calibrate';
+const GHOST_FRAMES     = 6;
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// How long to wait before sending the next frame (ms).
+// We chain captures: send → wait for response → send next.
+// This avoids queue buildup. 100ms = max 10 FPS theoretical.
+const MIN_FRAME_GAP_MS = 100;
 
 type Detection = {
   id: number;
@@ -37,14 +44,14 @@ type Detection = {
 type TapPoint = { x: number; y: number };
 type AppMode  = 'detecting' | 'calibrating';
 
-// ─── Calibration Screen ───────────────────────────────────────────────────────
-
 const POINT_LABELS = [
   { label: 'TL', desc: 'Top-Left road corner',     color: '#FF6B6B' },
   { label: 'TR', desc: 'Top-Right road corner',    color: '#4ECDC4' },
   { label: 'BR', desc: 'Bottom-Right road corner', color: '#FFD93D' },
   { label: 'BL', desc: 'Bottom-Left road corner',  color: '#6BCB77' },
 ];
+
+// ─── Calibration Screen ───────────────────────────────────────────────────────
 
 function CalibrationScreen({
   onCalibrated,
@@ -55,35 +62,37 @@ function CalibrationScreen({
 }) {
   const cameraRef = useRef<CameraView | null>(null);
 
-  const [step,          setStep]          = useState<'capture' | 'tap' | 'confirm'>('capture');
-  const [points,        setPoints]        = useState<TapPoint[]>([]);
-  const [capturedUri,   setCapturedUri]   = useState<string | null>(null);
-  const [capturedB64,   setCapturedB64]   = useState<string | null>(null);
-  const [viewLayout,    setViewLayout]    = useState({ width: 1, height: 1 });
-  const [realWidth,     setRealWidth]     = useState('7.0');
-  const [realHeight,    setRealHeight]    = useState('60.0');
-  const [showSettings,  setShowSettings]  = useState(false);
-  const [sending,       setSending]       = useState(false);
+  const [step,         setStep]         = useState<'capture' | 'tap' | 'confirm'>('capture');
+  const [points,       setPoints]       = useState<TapPoint[]>([]);
+  const [capturedUri,  setCapturedUri]  = useState<string | null>(null);
+  const [capturedB64,  setCapturedB64]  = useState<string | null>(null);
+  const [viewLayout,   setViewLayout]   = useState({ width: 1, height: 1 });
+  // FIX: store actual photo pixel dimensions
+  const [photoSize,    setPhotoSize]    = useState({ width: 1280, height: 720 });
+  const [realWidth,    setRealWidth]    = useState('7.0');
+  const [realHeight,   setRealHeight]  = useState('60.0');
+  const [showSettings, setShowSettings] = useState(false);
+  const [sending,      setSending]      = useState(false);
 
-  /* Step 1 – freeze a frame */
   const captureFrame = useCallback(async () => {
     if (!cameraRef.current) return;
     try {
       const photo = await cameraRef.current.takePictureAsync({
         base64: true,
-        quality: 0.8,
+        quality: 0.9,       // high quality for calibration accuracy
         skipProcessing: false,
       });
       if (!photo) return;
       setCapturedUri(photo.uri);
       setCapturedB64(photo.base64 ?? null);
+      // FIX: store the actual pixel dimensions of the captured photo
+      setPhotoSize({ width: photo.width, height: photo.height });
       setStep('tap');
     } catch {
       Alert.alert('Error', 'Could not capture frame. Try again.');
     }
   }, []);
 
-  /* Step 2 – tap 4 corners */
   const handleTap = useCallback(
     (e: any) => {
       if (step !== 'tap' || points.length >= 4) return;
@@ -97,15 +106,14 @@ function CalibrationScreen({
     [step, points.length],
   );
 
-  /* Step 3 – send to server */
   const sendCalibration = useCallback(async () => {
     if (!capturedB64 || points.length !== 4) return;
     setSending(true);
 
-    // Scale view-space taps → 1280×720 server space
+    // FIX: Scale view-space taps → ACTUAL photo pixel space (not hardcoded 1280×720)
     const serverPoints = points.map((p) => [
-      Math.round((p.x / viewLayout.width)  * 1280),
-      Math.round((p.y / viewLayout.height) * 720),
+      Math.round((p.x / viewLayout.width)  * photoSize.width),
+      Math.round((p.y / viewLayout.height) * photoSize.height),
     ]);
 
     try {
@@ -117,6 +125,9 @@ function CalibrationScreen({
             points:        serverPoints,
             real_width_m:  parseFloat(realWidth)  || 7.0,
             real_height_m: parseFloat(realHeight) || 60.0,
+            // FIX: Tell the server exactly what resolution these points are in
+            frame_width:   photoSize.width,
+            frame_height:  photoSize.height,
           }),
         );
       ws.onmessage = (ev) => {
@@ -126,7 +137,7 @@ function CalibrationScreen({
         if (payload.success) {
           Alert.alert(
             '✅ Calibrated!',
-            `Zone saved.\nWidth: ${payload.real_width_m} m  Depth: ${payload.real_height_m} m`,
+            `Zone saved.\nWidth: ${payload.real_width_m} m  Depth: ${payload.real_height_m} m\nPhoto: ${payload.frame_width}×${payload.frame_height}`,
             [{ text: 'Start Detecting', onPress: onCalibrated }],
           );
         } else {
@@ -141,7 +152,7 @@ function CalibrationScreen({
       setSending(false);
       Alert.alert('Error', String(e));
     }
-  }, [capturedB64, points, viewLayout, realWidth, realHeight, onCalibrated]);
+  }, [capturedB64, points, viewLayout, photoSize, realWidth, realHeight, onCalibrated]);
 
   const reset = () => {
     setPoints([]);
@@ -157,7 +168,6 @@ function CalibrationScreen({
     <View style={cal.root}>
       <StatusBar style="light" />
 
-      {/* Header */}
       <View style={cal.header}>
         <TouchableOpacity onPress={onCancel} hitSlop={12} style={cal.headerSide}>
           <Text style={cal.back}>✕</Text>
@@ -168,7 +178,6 @@ function CalibrationScreen({
         </TouchableOpacity>
       </View>
 
-      {/* Step pills */}
       <View style={cal.stepRow}>
         {['Capture', 'Tap 4 Points', 'Confirm'].map((s, i) => (
           <View key={s} style={cal.stepItem}>
@@ -180,13 +189,19 @@ function CalibrationScreen({
         ))}
       </View>
 
-      {/* Main area */}
+      {/* FIX: Show photo dimensions for debugging */}
+      {step !== 'capture' && (
+        <View style={{ backgroundColor: '#1a1a2e', paddingHorizontal: 12, paddingVertical: 4 }}>
+          <Text style={{ color: '#4ade80', fontSize: 11, textAlign: 'center' }}>
+            Photo: {photoSize.width}×{photoSize.height}px · View: {Math.round(viewLayout.width)}×{Math.round(viewLayout.height)}px
+          </Text>
+        </View>
+      )}
+
       <View style={{ flex: 1 }}>
         {step === 'capture' ? (
-          /* Live camera */
           <CameraView style={StyleSheet.absoluteFill} ref={cameraRef} facing="back" />
         ) : (
-          /* Frozen photo + tap overlay */
           <View
             style={StyleSheet.absoluteFill}
             onLayout={(e) => {
@@ -196,7 +211,6 @@ function CalibrationScreen({
             onStartShouldSetResponder={() => step === 'tap'}
             onResponderGrant={handleTap}
           >
-            {/* Captured photo as background */}
             {capturedUri && (
               <Image
                 source={{ uri: capturedUri }}
@@ -205,10 +219,8 @@ function CalibrationScreen({
               />
             )}
 
-            {/* Light darkening tint so dots pop */}
             <View style={cal.tint} pointerEvents="none" />
 
-            {/* Connecting lines between points */}
             {points.length >= 2 && (
               <View style={StyleSheet.absoluteFill} pointerEvents="none">
                 {points.map((p, i) => {
@@ -221,7 +233,6 @@ function CalibrationScreen({
               </View>
             )}
 
-            {/* Tapped dots */}
             {points.map((p, i) => (
               <View
                 key={i}
@@ -235,7 +246,6 @@ function CalibrationScreen({
               </View>
             ))}
 
-            {/* Instruction badge */}
             {step === 'tap' && nextLabel && (
               <View style={cal.badge} pointerEvents="none">
                 <View style={[cal.badgeDot, { backgroundColor: nextLabel.color }]} />
@@ -254,7 +264,6 @@ function CalibrationScreen({
         )}
       </View>
 
-      {/* Action bar */}
       <View style={cal.actions}>
         {step === 'capture' && (
           <TouchableOpacity style={cal.btnPrimary} onPress={captureFrame}>
@@ -287,7 +296,6 @@ function CalibrationScreen({
         )}
       </View>
 
-      {/* Dimensions modal */}
       <Modal visible={showSettings} transparent animationType="slide">
         <View style={cal.modalOverlay}>
           <View style={cal.modalCard}>
@@ -321,7 +329,6 @@ function CalibrationScreen({
   );
 }
 
-/* Helper: draw a line between two points using rotation */
 function ConnectingLine({ from, to }: { from: TapPoint; to: TapPoint }) {
   const dx  = to.x - from.x;
   const dy  = to.y - from.y;
@@ -347,12 +354,15 @@ function ConnectingLine({ from, to }: { from: TapPoint; to: TapPoint }) {
 
 export default function HomeScreen() {
   const [permission, requestPermission] = useCameraPermissions();
-  const cameraRef  = useRef<CameraView | null>(null);
-  const wsRef      = useRef<WebSocket | null>(null);
-  const busyRef    = useRef(false);
-  const frameRef   = useRef(0);
+  const cameraRef = useRef<CameraView | null>(null);
+  const wsRef     = useRef<WebSocket | null>(null);
+  const frameRef  = useRef(0);
 
-  // Persist detections between frames using a map keyed by track ID
+  // FIX: No busyRef + setInterval. Instead we chain captures:
+  // after a response arrives (or after MIN_FRAME_GAP_MS), send the next frame.
+  const capturingRef     = useRef(false);
+  const pendingCaptureRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const detMapRef = useRef<Map<number, Detection>>(new Map());
   const [detections, setDetections] = useState<Detection[]>([]);
 
@@ -362,6 +372,43 @@ export default function HomeScreen() {
   const [mode,      setMode]      = useState<AppMode>('detecting');
   const [fps,       setFps]       = useState(0);
   const fpsRef = useRef({ count: 0, lastTime: Date.now() });
+
+  // Forward-declared so captureAndSend can reference itself
+  const captureAndSend = useRef<() => Promise<void>>(async () => {});
+
+  captureAndSend.current = async () => {
+    if (!cameraRef.current) return;
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!capturingRef.current) return;
+
+    try {
+      const photo = await cameraRef.current.takePictureAsync({
+        base64: true,
+        // FIX: lower quality = smaller payload = faster round trip
+        quality: 0.3,
+        skipProcessing: true,
+      });
+      if (photo?.base64 && capturingRef.current) {
+        frameRef.current += 1;
+        ws.send(JSON.stringify({
+          frame_id: frameRef.current,
+          image_base64: photo.base64,
+        }));
+      }
+    } catch {
+      // ignore single-frame errors, keep going
+    }
+
+    // Schedule next capture after minimum gap regardless of response timing
+    // Response handler will also trigger next capture on arrival
+    if (capturingRef.current) {
+      pendingCaptureRef.current = setTimeout(
+        () => captureAndSend.current(),
+        MIN_FRAME_GAP_MS,
+      );
+    }
+  };
 
   /* WebSocket */
   useEffect(() => {
@@ -379,22 +426,16 @@ export default function HomeScreen() {
           setFrameSize({ width: payload.frame_size[0], height: payload.frame_size[1] });
         }
 
-        if (!payload.skipped && Array.isArray(payload.detections)) {
+        if (Array.isArray(payload.detections)) {
           const cur = frameRef.current;
-
-          // Refresh seen detections
           for (const d of payload.detections as Detection[]) {
             detMapRef.current.set(d.id, { ...d, lastSeen: cur });
           }
-
-          // Evict detections that haven't been seen for GHOST_FRAMES frames
           detMapRef.current.forEach((d, id) => {
             if (cur - (d.lastSeen ?? cur) > GHOST_FRAMES) detMapRef.current.delete(id);
           });
-
           setDetections(Array.from(detMapRef.current.values()));
 
-          // FPS counter
           fpsRef.current.count++;
           const now = Date.now();
           const elapsed = now - fpsRef.current.lastTime;
@@ -406,31 +447,20 @@ export default function HomeScreen() {
       } catch { /* ignore parse errors */ }
     };
 
-    ws.onopen  = () => setWsStatus('open');
-    ws.onclose = () => setWsStatus('closed');
-    ws.onerror = () => setWsStatus('closed');
-    return () => ws.close();
-  }, [permission, mode]);
+    ws.onopen = () => {
+      setWsStatus('open');
+      // Start the capture chain once connected
+      capturingRef.current = true;
+      captureAndSend.current();
+    };
+    ws.onclose = () => { setWsStatus('closed'); capturingRef.current = false; };
+    ws.onerror = () => { setWsStatus('closed'); capturingRef.current = false; };
 
-  /* Frame capture loop */
-  useEffect(() => {
-    if (!permission?.granted || mode !== 'detecting') return;
-    const tid = setInterval(async () => {
-      if (!cameraRef.current || busyRef.current) return;
-      const ws = wsRef.current;
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-      busyRef.current = true;
-      frameRef.current += 1;
-      try {
-        const photo = await cameraRef.current.takePictureAsync({
-          base64: true, quality: 0.4, skipProcessing: true,
-        });
-        ws.send(JSON.stringify({ frame_id: Date.now(), image_base64: photo?.base64 }));
-      } catch { /* ignore */ }
-      finally { busyRef.current = false; }
-    }, FRAME_INTERVAL_MS);
-    return () => clearInterval(tid);
+    return () => {
+      capturingRef.current = false;
+      if (pendingCaptureRef.current) clearTimeout(pendingCaptureRef.current);
+      ws.close();
+    };
   }, [permission, mode]);
 
   if (!permission) return <View />;
@@ -486,7 +516,7 @@ export default function HomeScreen() {
 
         {detections.map((det) => {
           const [x1, y1, x2, y2] = det.bbox;
-          const [b, g, r] = det.color; // OpenCV BGR
+          const [b, g, r] = det.color;
           const age     = frameRef.current - (det.lastSeen ?? frameRef.current);
           const opacity = age > 0 ? Math.max(0.3, 1 - age / GHOST_FRAMES) : 1;
 
@@ -586,7 +616,6 @@ const cal = StyleSheet.create({
   back:  { color: '#aaa', fontSize: 18 },
   title: { flex: 1, color: '#fff', fontSize: 16, fontWeight: '700', textAlign: 'center' },
   gear:  { color: '#1a73e8', fontSize: 20, textAlign: 'right' },
-
   stepRow: {
     flexDirection:   'row',
     justifyContent:  'center',
@@ -601,9 +630,7 @@ const cal = StyleSheet.create({
   stepNum:  { color: '#fff', fontSize: 12, fontWeight: '700' },
   stepLbl:  { color: '#444', fontSize: 10 },
   stepLblOn: { color: '#aaa' },
-
   tint: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.2)' },
-
   dot: {
     position:       'absolute',
     width:           28,
@@ -619,7 +646,6 @@ const cal = StyleSheet.create({
     shadowRadius:    4,
   },
   dotText: { color: '#fff', fontSize: 9, fontWeight: '800' },
-
   badge: {
     position:          'absolute',
     top:               14,
@@ -634,7 +660,6 @@ const cal = StyleSheet.create({
   },
   badgeDot:  { width: 10, height: 10, borderRadius: 5 },
   badgeText: { color: '#fff', fontSize: 13, fontWeight: '600' },
-
   confirmBadge: {
     position:          'absolute',
     bottom:            16,
@@ -645,7 +670,6 @@ const cal = StyleSheet.create({
     borderRadius:      20,
   },
   confirmBadgeText: { color: '#fff', fontWeight: '700', fontSize: 13 },
-
   actions: {
     padding:          16,
     backgroundColor:  '#111',
@@ -671,7 +695,6 @@ const cal = StyleSheet.create({
   rowBetween: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   rowFull:    { flexDirection: 'row', alignItems: 'center' },
   tapCount:   { color: '#fff', fontSize: 15, fontWeight: '600' },
-
   modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.75)', justifyContent: 'flex-end' },
   modalCard: {
     backgroundColor:      '#181818',

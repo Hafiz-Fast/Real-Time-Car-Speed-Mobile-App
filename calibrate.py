@@ -23,7 +23,7 @@ def click_event(event, x, y, flags, param):
             print("\n── Copy these into step3_speed.py ──")
             print(f"SOURCE_POINTS = np.float32({points})")
 
-cap = cv2.VideoCapture("test3.mp4")
+cap = cv2.VideoCapture("test4.mp4")
 ret, img = cap.read()
 cap.release()
 

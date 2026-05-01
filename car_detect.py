@@ -9,10 +9,10 @@ tracker = DeepSort(max_age=15)  # Fix 3: reduced from 50 to prevent ghost tracks
 VEHICLE_CLASSES = [2, 3, 5, 7]
 
 SOURCE_POINTS = np.float32([
-    [1851, 1115],  # top-left
-    [2049, 1103],  # top-right
-    [2295, 1750],  # bottom-right
-    [1311, 1716],  # bottom-left
+    [209, 276],  # top-left
+    [293, 276],  # top-right
+    [428, 663],  # bottom-right
+    [7, 529],  # bottom-left
 ])
 
 REAL_WIDTH  = 7.0
@@ -50,7 +50,7 @@ def fit_to_screen(frame, screen_width=1280, screen_height=720):
 track_history = defaultdict(lambda: deque(maxlen=25))
 track_speeds  = defaultdict(float)
 
-cap = cv2.VideoCapture("test3.mp4")
+cap = cv2.VideoCapture("test4.mp4")
 FPS = cap.get(cv2.CAP_PROP_FPS)
 print(f"Video FPS: {FPS}")
 
