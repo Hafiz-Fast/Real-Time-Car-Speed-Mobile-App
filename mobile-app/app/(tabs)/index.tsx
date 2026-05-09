@@ -1,5 +1,7 @@
-// app/(tabs)/index.tsx
-// Architecture: Calibrate with photo → Record ≤30 s video → Upload → Poll → Play result
+// RollNo: 23L-0896
+// RollNo: 23L-0729
+
+// Architecture: Calibrate with photo → Record upto 30s video → Upload to serever → Poll → Play result
 
 import { CameraView, useCameraPermissions, useMicrophonePermissions } from 'expo-camera';
 import { useEffect, useRef, useState, useCallback } from 'react';
@@ -21,17 +23,17 @@ import { StatusBar } from 'expo-status-bar';
 import { Video, ResizeMode } from 'expo-av';
 import * as FileSystem from 'expo-file-system/legacy';
 
-// ─── CONFIG ───────────────────────────────────────────────────────────────────
+// CONFIG
 const SERVER_BASE = 'http://192.168.100.25:8000';
 const WS_CALIBRATE_URL = 'ws://192.168.100.25:8000/ws/calibrate';
 
-/** Maximum recording duration in seconds */
+// Maximum recording duration in seconds
 const MAX_RECORD_SECONDS = 30;
 
-/** How often (ms) to poll /job/:id for progress */
+// How often (ms) to poll /job/:id for progress
 const POLL_INTERVAL_MS = 1500;
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// Types
 type AppMode =
   | 'home'           // idle — shows record/calibrate buttons
   | 'calibrating'    // calibration sub-flow
@@ -50,7 +52,7 @@ const POINT_LABELS = [
   { label: 'BL', desc: 'Bottom-Left corner', color: '#6BCB77' },
 ];
 
-// ─── Calibration Screen ───────────────────────────────────────────────────────
+// Calibration Screen
 function CalibrationScreen({
   onCalibrated,
   onCancel,
@@ -69,6 +71,15 @@ function CalibrationScreen({
   const [realHeight, setRealHeight] = useState('60.0');
   const [showSettings, setShowSettings] = useState(false);
   const [sending, setSending] = useState(false);
+  // Delay mounting CameraView so the home-screen camera session fully releases first
+  const [cameraVisible, setCameraVisible] = useState(false);
+  const [cameraReady, setCameraReady] = useState(false);
+
+  useEffect(() => {
+    // Give the OS ~400 ms to tear down the previous CameraView before mounting ours
+    const t = setTimeout(() => setCameraVisible(true), 400);
+    return () => clearTimeout(t);
+  }, []);
 
   const captureFrame = useCallback(async () => {
     if (!cameraRef.current) return;
@@ -130,7 +141,7 @@ function CalibrationScreen({
         ws.onerror = () => reject(new Error('Connection error'));
       });
       setSending(false);
-      Alert.alert('✅ Calibrated!', `Road zone saved.\n${photoSize.width}×${photoSize.height}px`, [
+      Alert.alert('Calibrated!', `Road zone saved.\n${photoSize.width}×${photoSize.height}px`, [
         { text: 'Start Recording', onPress: () => onCalibrated(JSON.stringify(calConfig)) },
       ]);
     } catch (err: any) {
@@ -143,6 +154,7 @@ function CalibrationScreen({
     setPoints([]);
     setCapturedUri(null);
     setCapturedB64(null);
+    setCameraReady(false);  // CameraView re-mounts; wait for onCameraReady again
     setStep('capture');
   };
 
@@ -187,7 +199,23 @@ function CalibrationScreen({
       {/* Camera / Image area */}
       <View style={{ flex: 1 }}>
         {step === 'capture' ? (
-          <CameraView style={StyleSheet.absoluteFill} ref={cameraRef} facing="back" />
+          <>
+            {/* Spinner shown until camera session is ready */}
+            {(!cameraVisible || !cameraReady) && (
+              <View style={[StyleSheet.absoluteFill, { alignItems: 'center', justifyContent: 'center', backgroundColor: '#000' }]}>
+                <ActivityIndicator size="large" color="#1a73e8" />
+                <Text style={{ color: '#888', fontSize: 13, marginTop: 12 }}>Starting camera…</Text>
+              </View>
+            )}
+            {cameraVisible && (
+              <CameraView
+                style={StyleSheet.absoluteFill}
+                ref={cameraRef}
+                facing="back"
+                onCameraReady={() => setCameraReady(true)}
+              />
+            )}
+          </>
         ) : (
           <View
             style={StyleSheet.absoluteFill}
@@ -258,8 +286,14 @@ function CalibrationScreen({
       {/* Actions */}
       <View style={cal.actions}>
         {step === 'capture' && (
-          <TouchableOpacity style={cal.btnPrimary} onPress={captureFrame}>
-            <Text style={cal.btnPrimaryTxt}>📸  Freeze Frame</Text>
+          <TouchableOpacity
+            style={[cal.btnPrimary, !cameraReady && { opacity: 0.45 }]}
+            onPress={captureFrame}
+            disabled={!cameraReady}
+          >
+            {cameraReady
+              ? <Text style={cal.btnPrimaryTxt}>📸  Freeze Frame</Text>
+              : <ActivityIndicator color="#fff" />}
           </TouchableOpacity>
         )}
         {step === 'tap' && (
@@ -325,7 +359,7 @@ function CalibrationScreen({
   );
 }
 
-// ─── Zone polygon overlay ─────────────────────────────────────────────────────
+// Zone polygon overlay
 function ZonePolygon({ points }: { points: TapPoint[] }) {
   // Draw a translucent quadrilateral using absolute-positioned View tricks
   // A proper SVG overlay would be ideal, but RN core doesn't have it.
@@ -352,7 +386,7 @@ function ZonePolygon({ points }: { points: TapPoint[] }) {
   );
 }
 
-// ─── Connecting line ──────────────────────────────────────────────────────────
+// Connecting line
 function ConnectingLine({ from, to }: { from: TapPoint; to: TapPoint }) {
   const dx = to.x - from.x;
   const dy = to.y - from.y;
@@ -374,7 +408,7 @@ function ConnectingLine({ from, to }: { from: TapPoint; to: TapPoint }) {
   );
 }
 
-// ─── Progress Ring ────────────────────────────────────────────────────────────
+// Progress Ring
 function ProgressRing({ progress }: { progress: number }) {
   return (
     <View style={ring.container}>
@@ -392,7 +426,7 @@ function ProgressRing({ progress }: { progress: number }) {
   );
 }
 
-// ─── Home Screen ──────────────────────────────────────────────────────────────
+// Home Screen
 export default function HomeScreen() {
   const [permission, requestPermission] = useCameraPermissions();
   const [micPermission, requestMicPermission] = useMicrophonePermissions();
@@ -572,7 +606,7 @@ export default function HomeScreen() {
     };
   }, []);
 
-  // ── Permission gate ────────────────────────────────────────────────────────
+  // Permission gate
   if (!permission || !micPermission) return <View />;
 
   const needsCamera = !permission.granted;
@@ -602,7 +636,7 @@ export default function HomeScreen() {
     );
   }
 
-  // ── Calibration sub-flow ───────────────────────────────────────────────────
+  // Calibration sub-flow
   if (mode === 'calibrating') {
     return (
       <CalibrationScreen
@@ -612,7 +646,7 @@ export default function HomeScreen() {
     );
   }
 
-  // ── Result viewer ──────────────────────────────────────────────────────────
+  // Result viewer
   if (mode === 'result' && resultUri) {
     return (
       <View style={S.root}>
@@ -637,7 +671,7 @@ export default function HomeScreen() {
         />
         <View style={S.resultActions}>
           <Text style={S.resultHint}>
-            ✅ Speed detection complete. Bounding boxes, zone, and speed labels are burned into the video.
+            Speed detection complete. Bounding boxes, zone, and speed labels are burned into the video.
           </Text>
           <TouchableOpacity
             style={[S.calBtn, { alignSelf: 'center', marginTop: 12, paddingHorizontal: 20, paddingVertical: 10 }]}
@@ -650,7 +684,7 @@ export default function HomeScreen() {
     );
   }
 
-  // ── Post-record: zone preference ──────────────────────────────────────────
+  // Post-record: zone preference
   if (mode === 'post-record') {
     return (
       <View style={S.root}>
@@ -753,7 +787,7 @@ export default function HomeScreen() {
     );
   }
 
-  // ── Processing screen ──────────────────────────────────────────────────────
+  // Processing screen
   if (mode === 'processing') {
     return (
       <View style={S.root}>
@@ -771,7 +805,7 @@ export default function HomeScreen() {
     );
   }
 
-  // ── Uploading screen ───────────────────────────────────────────────────────
+  // Uploading screen
   if (mode === 'uploading') {
     return (
       <View style={S.root}>
@@ -789,7 +823,7 @@ export default function HomeScreen() {
     );
   }
 
-  // ── Home & Recording ─────────────────────────────────────────────────────
+  // Home & Recording
   // These are combined to avoid unmounting the CameraView, which causes failures
   const hasCalibration = calJson !== null;
   const isRecordingMode = mode === 'recording';
@@ -900,7 +934,7 @@ export default function HomeScreen() {
   );
 }
 
-// ─── Styles ───────────────────────────────────────────────────────────────────
+// Styles
 const SB_H = Platform.OS === 'android' ? (RNStatusBar.currentHeight ?? 24) : 44;
 const { width: SCREEN_W } = Dimensions.get('window');
 
@@ -1037,7 +1071,7 @@ const S = StyleSheet.create({
   },
   stopHint: { color: '#ccc', fontSize: 13, marginTop: 10 },
 
-  // ── Result ──
+  // Result
   videoPlayer: {
     flex: 1,
     backgroundColor: '#000',
@@ -1056,7 +1090,7 @@ const S = StyleSheet.create({
   },
 });
 
-// ─── Progress ring styles ─────────────────────────────────────────────────────
+// Progress ring styles
 const ring = StyleSheet.create({
   container: { alignItems: 'center', width: SCREEN_W * 0.7 },
   outer: {
@@ -1082,7 +1116,7 @@ const ring = StyleSheet.create({
   barFill: { height: 8, backgroundColor: '#1a73e8', borderRadius: 4 },
 });
 
-// ─── Calibration styles ───────────────────────────────────────────────────────
+// Calibration styles
 const cal = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#0a0a0a' },
   header: {

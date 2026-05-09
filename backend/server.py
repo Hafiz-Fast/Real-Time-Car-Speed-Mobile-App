@@ -1,3 +1,6 @@
+# RollNo: 23L-0896
+# RollNo: 23L-0729
+
 import asyncio
 import base64
 import json
@@ -27,7 +30,7 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 VEHICLE_CLASSES = [2, 3, 5, 7]
 
-# ─── Config / Calibration ────────────────────────────────────────────────────
+# Config / Calibration
 
 def load_config() -> Dict[str, Any]:
     if CONFIG_PATH.exists():
@@ -81,7 +84,7 @@ app.add_middleware(
 # Track processing jobs: job_id -> {"status": ..., "progress": ..., "output_path": ...}
 JOBS: Dict[str, Dict[str, Any]] = {}
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+# Helpers
 
 def pixel_to_world(pixel_point: Any, homography: np.ndarray) -> np.ndarray:
     point       = np.array([[pixel_point]], dtype=np.float32)
@@ -224,7 +227,7 @@ def draw_hud(frame: np.ndarray, frame_num: int, total_frames: int,
     return frame
 
 
-# ─── Speed Estimator ─────────────────────────────────────────────────────────
+# Speed Estimator
 
 class SpeedEstimator:
     def __init__(self, model: YOLO) -> None:
@@ -325,7 +328,7 @@ class SpeedEstimator:
         return {"detections": detections, "frame_size": [frame_w, frame_h]}
 
 
-# ─── Video Processing Job ────────────────────────────────────────────────────
+# Video Processing Job
 
 def process_video_job(
     job_id:      str,
@@ -407,7 +410,7 @@ def process_video_job(
             pass
 
 
-# ─── REST / WS Endpoints ─────────────────────────────────────────────────────
+# REST / WS Endpoints
 
 @app.get("/health")
 async def health() -> Dict[str, str]:
@@ -528,7 +531,7 @@ async def delete_job(job_id: str) -> Dict[str, str]:
     return {"deleted": job_id}
 
 
-# ─── WebSocket: Calibrate ─────────────────────────────────────────────────────
+# WebSocket: Calibrate
 
 @app.websocket("/ws/calibrate")
 async def calibrate_endpoint(websocket: WebSocket) -> None:
@@ -574,7 +577,7 @@ async def calibrate_endpoint(websocket: WebSocket) -> None:
         await websocket.send_text(json.dumps({"success": False, "error": str(exc)}))
 
 
-# ─── WebSocket: Live (kept for optional use) ─────────────────────────────────
+# WebSocket: Live (kept for optional use)
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
