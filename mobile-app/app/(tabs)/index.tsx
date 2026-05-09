@@ -22,8 +22,8 @@ import { Video, ResizeMode } from 'expo-av';
 import * as FileSystem from 'expo-file-system/legacy';
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
-const SERVER_BASE = 'http://192.168.100.45:8000';
-const WS_CALIBRATE_URL = 'ws://192.168.100.45:8000/ws/calibrate';
+const SERVER_BASE = 'http://192.168.100.25:8000';
+const WS_CALIBRATE_URL = 'ws://192.168.100.25:8000/ws/calibrate';
 
 /** Maximum recording duration in seconds */
 const MAX_RECORD_SECONDS = 30;
@@ -36,6 +36,7 @@ type AppMode =
   | 'home'           // idle — shows record/calibrate buttons
   | 'calibrating'    // calibration sub-flow
   | 'recording'      // actively recording
+  | 'post-record'    // ask user zone preference before uploading
   | 'uploading'      // sending video to server
   | 'processing'     // server is working — showing progress
   | 'result';        // show annotated video
@@ -407,11 +408,19 @@ export default function HomeScreen() {
   const [jobProgress, setJobProgress] = useState(0);
   const [resultUri, setResultUri] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [showZone, setShowZone] = useState(true);
+  const showZoneRef = useRef(true);           // always reflects latest showZone for closures
+  const pendingJobIdRef = useRef<string | null>(null);
+  const pendingVideoUriRef = useRef<string | null>(null);
 
   const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-
+  // Keeps showZoneRef in sync so uploadVideo closure always reads the latest value
+  const setShowZoneSync = useCallback((val: boolean) => {
+    showZoneRef.current = val;
+    setShowZone(val);
+  }, []);
 
 
   const stopPolling = useCallback(() => {
@@ -480,7 +489,10 @@ export default function HomeScreen() {
           httpMethod: 'POST',
           uploadType: FileSystem.FileSystemUploadType.MULTIPART,
           fieldName: 'video',
-          parameters: { calibration_json: calPayload },
+          parameters: {
+            calibration_json: calPayload,
+            show_zone: showZoneRef.current ? 'true' : 'false',
+          },
           mimeType: 'video/mp4',
         },
       );
@@ -539,7 +551,9 @@ export default function HomeScreen() {
         maxDuration: MAX_RECORD_SECONDS,
       });
       if (video?.uri) {
-        await uploadVideo(video.uri);
+        pendingVideoUriRef.current = video.uri;
+        setShowZoneSync(true); // reset to default each time
+        setMode('post-record');
       }
     } catch (err: any) {
       setIsRecording(false);
@@ -630,6 +644,109 @@ export default function HomeScreen() {
             onPress={() => { setResultUri(null); setJobId(null); setMode('home'); }}
           >
             <Text style={S.calBtnTxt}>🔁 Record Another</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    );
+  }
+
+  // ── Post-record: zone preference ──────────────────────────────────────────
+  if (mode === 'post-record') {
+    return (
+      <View style={S.root}>
+        <StatusBar style="light" />
+        <View style={S.center}>
+          <Text style={{ color: '#fff', fontSize: 22, fontWeight: '800', marginBottom: 8 }}>
+            🎥 Video Ready
+          </Text>
+          <Text style={{ color: '#888', fontSize: 14, marginBottom: 36, textAlign: 'center', paddingHorizontal: 32 }}>
+            Show the calibrated road zone overlay in the processed video?
+          </Text>
+
+          {/* Live preview illustration */}
+          <View style={{
+            width: 240, height: 135, borderRadius: 12, backgroundColor: '#111',
+            borderWidth: 1, borderColor: '#333', marginBottom: 32,
+            alignItems: 'center', justifyContent: 'center', overflow: 'hidden',
+          }}>
+            <View style={{ position: 'absolute', bottom: 0, left: 0, right: 0, height: '100%', backgroundColor: '#1a1a1a' }} />
+            {showZone && (
+              <>
+                <View style={{
+                  position: 'absolute',
+                  bottom: 10, left: 40, right: 40, top: 30,
+                  backgroundColor: 'rgba(255,180,0,0.15)',
+                  borderWidth: 2, borderColor: 'rgba(255,200,0,0.7)',
+                }} />
+                {[
+                  { top: 32, left: 40, color: '#FF6B6B', label: 'TL' },
+                  { top: 32, right: 40, color: '#4ECDC4', label: 'TR' },
+                  { bottom: 12, right: 40, color: '#FFD93D', label: 'BR' },
+                  { bottom: 12, left: 40, color: '#6BCB77', label: 'BL' },
+                ].map(({ label, color, ...pos }) => (
+                  <View key={label} style={[{
+                    position: 'absolute', width: 18, height: 18, borderRadius: 9,
+                    backgroundColor: color, borderWidth: 2, borderColor: '#fff',
+                    alignItems: 'center', justifyContent: 'center',
+                  }, pos as any]}>
+                    <Text style={{ color: '#fff', fontSize: 7, fontWeight: '800' }}>{label}</Text>
+                  </View>
+                ))}
+              </>
+            )}
+            {/* Simulated vehicle detection box */}
+            <View style={{ width: 40, height: 28, borderWidth: 2, borderColor: '#00ff88', borderRadius: 4 }}>
+              <View style={{ position: 'absolute', top: -14, left: 0, backgroundColor: '#00ff88', paddingHorizontal: 3, borderRadius: 2 }}>
+                <Text style={{ color: '#000', fontSize: 7, fontWeight: '700' }}>ID:3  72 km/h</Text>
+              </View>
+            </View>
+            <Text style={{ position: 'absolute', bottom: 6, color: '#555', fontSize: 9 }}>
+              {showZone ? '▪ Zone overlay ON' : '▪ Detections only'}
+            </Text>
+          </View>
+
+          {/* Toggle */}
+          <View style={{ flexDirection: 'row', gap: 14, marginBottom: 36, paddingHorizontal: 24, width: '100%' }}>
+            <TouchableOpacity
+              style={{
+                flex: 1, paddingVertical: 16, borderRadius: 12, alignItems: 'center',
+                backgroundColor: showZone ? '#1a73e8' : '#1e1e1e',
+                borderWidth: 2, borderColor: showZone ? '#1a73e8' : '#333',
+              }}
+              onPress={() => setShowZoneSync(true)}
+            >
+              <Text style={{ fontSize: 20, marginBottom: 4 }}>🟦</Text>
+              <Text style={{ color: showZone ? '#fff' : '#555', fontWeight: '700', fontSize: 14 }}>Show Zone</Text>
+              <Text style={{ color: showZone ? '#a0c4ff' : '#444', fontSize: 11, marginTop: 2 }}>With overlay</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={{
+                flex: 1, paddingVertical: 16, borderRadius: 12, alignItems: 'center',
+                backgroundColor: !showZone ? '#1a73e8' : '#1e1e1e',
+                borderWidth: 2, borderColor: !showZone ? '#1a73e8' : '#333',
+              }}
+              onPress={() => setShowZoneSync(false)}
+            >
+              <Text style={{ fontSize: 20, marginBottom: 4 }}>⬛</Text>
+              <Text style={{ color: !showZone ? '#fff' : '#555', fontWeight: '700', fontSize: 14 }}>Hide Zone</Text>
+              <Text style={{ color: !showZone ? '#a0c4ff' : '#444', fontSize: 11, marginTop: 2 }}>Detections only</Text>
+            </TouchableOpacity>
+          </View>
+
+          {/* Confirm */}
+          <TouchableOpacity
+            style={{ backgroundColor: '#1a73e8', paddingVertical: 16, paddingHorizontal: 48, borderRadius: 14, marginBottom: 14 }}
+            onPress={() => {
+              const uri = pendingVideoUriRef.current;
+              if (uri) uploadVideo(uri);
+            }}
+          >
+            <Text style={{ color: '#fff', fontSize: 16, fontWeight: '700' }}>☁  Upload & Process</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity onPress={() => { pendingVideoUriRef.current = null; setMode('home'); }}>
+            <Text style={{ color: '#555', fontSize: 13 }}>✕  Discard recording</Text>
           </TouchableOpacity>
         </View>
       </View>

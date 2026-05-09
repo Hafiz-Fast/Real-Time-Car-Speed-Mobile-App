@@ -332,10 +332,11 @@ def process_video_job(
     video_path:  str,
     calibration: Dict[str, Any],
     output_path: str,
+    draw_zone:   bool = True,
 ) -> None:
     """
     Runs in a thread pool. Reads every frame, runs YOLO+DeepSort,
-    draws zone + bounding boxes, writes annotated video to output_path.
+    optionally draws zone + bounding boxes, writes annotated video to output_path.
     Updates JOBS[job_id] with progress.
     """
     try:
@@ -368,8 +369,9 @@ def process_video_job(
 
             result = estimator.process_frame(frame, cal, timestamp)
 
-            # Draw calibration zone first (below boxes)
-            frame = draw_zone_overlay(frame, cal["zone_polygon"])
+            # Draw calibration zone first (below boxes) — only if requested
+            if draw_zone:
+                frame = draw_zone_overlay(frame, cal["zone_polygon"])
 
             # Draw each detection
             for det in result["detections"]:
@@ -427,6 +429,7 @@ async def process_video(
     background_tasks: BackgroundTasks,
     video: UploadFile = File(...),
     calibration_json: str = Form(...),   # JSON string of calibration config
+    show_zone: str = Form("true"),       # "true" | "false" — whether to burn zone overlay
 ) -> Dict[str, Any]:
     """
     Accept a video file + calibration JSON from mobile.
@@ -441,6 +444,9 @@ async def process_video(
         cal_config = CONFIG
 
     calibration = build_calibration(cal_config)
+
+    # Parse show_zone flag (accepts "true"/"false" strings from multipart form)
+    draw_zone = show_zone.lower() not in ("false", "0", "no")
 
     # Save upload to temp file
     suffix     = Path(video.filename or "video.mp4").suffix or ".mp4"
@@ -461,7 +467,7 @@ async def process_video(
 
     # Run processing in background (CPU-bound sync function)
     background_tasks.add_task(
-        _run_sync_job, job_id, tmp_input.name, calibration, output_path
+        _run_sync_job, job_id, tmp_input.name, calibration, output_path, draw_zone
     )
 
     return {"job_id": job_id, "status": "queued"}
@@ -469,10 +475,11 @@ async def process_video(
 
 def _run_sync_job(
     job_id: str, video_path: str,
-    calibration: Dict[str, Any], output_path: str
+    calibration: Dict[str, Any], output_path: str,
+    draw_zone: bool = True,
 ) -> None:
     """Thin sync wrapper so FastAPI BackgroundTasks can call process_video_job."""
-    process_video_job(job_id, video_path, calibration, output_path)
+    process_video_job(job_id, video_path, calibration, output_path, draw_zone)
 
 
 @app.get("/job/{job_id}")
